@@ -1,0 +1,14 @@
+torch>=2.3.0
+torchvision
+torchaudio
+transformers
+peft
+lightgbm
+pandas
+numpy
+scikit-learn
+matplotlib
+seaborn
+shap
+pyyaml
+tqdm

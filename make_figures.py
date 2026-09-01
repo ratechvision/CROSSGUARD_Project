@@ -1,0 +1,1 @@
+print('Generate figures after training.')

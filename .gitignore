@@ -1,0 +1,17 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated outputs
+artifacts/
+*.pt
+*.npy
+
+# Large datasets
+data/ids2018/
+data/network_traffic/
+data/relational_data/
+
+# VS Code
+.vscode/
