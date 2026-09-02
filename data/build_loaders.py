@@ -12,8 +12,11 @@ from torch.utils.data import Dataset, DataLoader
 
 DATA_DIR = Path("data/ids2018")
 
-# Global encoder (same mapping for Train/Val/Test)
+# Global Label Encoder
 LABEL_ENCODER = LabelEncoder()
+
+# Global Feature Scaler
+SCALER = StandardScaler()
 
 
 # ---------------------------------------------------------
@@ -22,42 +25,43 @@ LABEL_ENCODER = LabelEncoder()
 
 class CICDataset(Dataset):
 
-    def __init__(self, csv_file, fit_encoder=False):
+    def __init__(self, csv_file, fit=False):
 
         print(f"Loading {csv_file.name}")
 
-        self.df = pd.read_csv(csv_file, low_memory=False)
-
-        self.df.columns = self.df.columns.str.strip()
+        df = pd.read_csv(csv_file, low_memory=False)
+        df.columns = df.columns.str.strip()
 
         # Remove invalid values
-        self.df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        self.df.dropna(inplace=True)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.dropna(inplace=True)
 
-        # ---------------- LABELS ----------------
+        # ---------------- LABEL ----------------
 
-        labels = self.df["Label"]
+        labels = df["Label"]
 
-        if fit_encoder:
+        if fit:
             self.labels = LABEL_ENCODER.fit_transform(labels)
         else:
             self.labels = LABEL_ENCODER.transform(labels)
 
         # ---------------- FEATURES ----------------
 
-        self.features = self.df.drop(columns=["Label"])
+        features = df.drop(columns=["Label"])
 
-        # Keep only numeric columns
-        self.features = self.features.select_dtypes(include=np.number)
+        # Keep only numeric features
+        features = features.select_dtypes(include=np.number)
 
-        # CICIDS2017 uses 78 numeric flow features
-        self.features = self.features.iloc[:, :78]
+        # CICIDS2017 = 78 numerical flow features
+        features = features.iloc[:, :78]
 
-        scaler = StandardScaler()
+        # Use ONE scaler for all splits
+        if fit:
+            features = SCALER.fit_transform(features)
+        else:
+            features = SCALER.transform(features)
 
-        self.features = scaler.fit_transform(self.features)
-
-        self.features = torch.tensor(self.features, dtype=torch.float32)
+        self.features = torch.tensor(features, dtype=torch.float32)
         self.labels = torch.tensor(self.labels, dtype=torch.long)
 
     def __len__(self):
@@ -79,48 +83,51 @@ class CICDataset(Dataset):
 # DATALOADER
 # ---------------------------------------------------------
 
-def create_loaders(batch_size=128):
+def create_loaders(batch_size=256):
 
-    train = CICDataset(DATA_DIR / "train.csv", fit_encoder=True)
+    train_dataset = CICDataset(DATA_DIR / "train.csv", fit=True)
 
-    val = CICDataset(DATA_DIR / "val.csv")
+    val_dataset = CICDataset(DATA_DIR / "val.csv")
 
-    test = CICDataset(DATA_DIR / "test.csv")
+    test_dataset = CICDataset(DATA_DIR / "test.csv")
 
     train_loader = DataLoader(
-        train,
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
     )
 
     val_loader = DataLoader(
-        val,
+        val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
     )
 
     test_loader = DataLoader(
-        test,
+        test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
-        pin_memory=True,
+        num_workers=2,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True,
     )
 
     return train_loader, val_loader, test_loader
 
 
 # ---------------------------------------------------------
-# TEST
+# UNIT TEST
 # ---------------------------------------------------------
 
 if __name__ == "__main__":
 
-    train_loader, val_loader, test_loader = create_loaders(32)
+    train_loader, val_loader, test_loader = create_loaders()
 
     x, y = next(iter(train_loader))
 
@@ -130,6 +137,7 @@ if __name__ == "__main__":
     print("Feature Shape :", x.shape)
     print("Label Shape   :", y.shape)
     print("No. Classes   :", len(LABEL_ENCODER.classes_))
+
     print("\nClasses:")
-    for i, c in enumerate(LABEL_ENCODER.classes_):
-        print(f"{i:2d} -> {c}")
+    for i, cls in enumerate(LABEL_ENCODER.classes_):
+        print(f"{i:2d} -> {cls}")
