@@ -24,21 +24,25 @@ ART.mkdir(exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-EPOCHS = 5
-LR = 1e-4
+EPOCHS = 30
+BATCH_SIZE = 256
+LR = 2e-4
 NUM_CLASSES = 15
+PATIENCE = 5
 
-print(f"[CROSSGUARD] Device : {DEVICE}")
+print("=" * 50)
+print("CROSSGUARD TRAINING")
+print("=" * 50)
+print("Device :", DEVICE)
 
 # -------------------------------------------------------
 # DATA
 # -------------------------------------------------------
 
-train_loader, val_loader, test_loader = create_loaders(batch_size=64)
+train_loader, val_loader, test_loader = create_loaders(batch_size=BATCH_SIZE)
 
 reports = load_reports()
 CLASS_NAMES = list(LABEL_ENCODER.classes_)
-
 graph = build_demo_graph().to(DEVICE)
 
 # -------------------------------------------------------
@@ -62,8 +66,11 @@ params = (
 optimizer = torch.optim.AdamW(params, lr=LR)
 criterion = nn.CrossEntropyLoss()
 
-history = []
+scaler = torch.amp.GradScaler("cuda")
 
+history = []
+best_f1 = 0
+patience_counter = 0
 
 # -------------------------------------------------------
 # HELPER
@@ -74,7 +81,6 @@ def batch_reports(batch_size, offset):
     for i in range(batch_size):
         txt.append(reports[(offset + i) % len(reports)])
     return txt
-
 
 # -------------------------------------------------------
 # TRAIN
@@ -90,40 +96,129 @@ for epoch in range(EPOCHS):
 
     total_loss = 0
 
-    for step, (x, y) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
+    loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
 
-        x = x.to(DEVICE)
-        y = y.to(DEVICE)
+    for step, (x, y) in enumerate(loop):
 
-        flow_emb = flow_encoder(x)
+        x = x.to(DEVICE, non_blocking=True)
+        y = y.to(DEVICE, non_blocking=True)
 
-        text_emb = text_encoder(batch_reports(len(x), step))
+        optimizer.zero_grad()
+
+        with torch.amp.autocast("cuda"):
+
+            flow_emb = flow_encoder(x)
+            text_emb = text_encoder(batch_reports(len(x), step))
+            graph_emb = graph_encoder(graph)
+
+            fused, _ = fusion(flow_emb, text_emb, graph_emb)
+            logits = classifier(fused)
+
+            loss = criterion(logits, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        total_loss += loss.item()
+        loop.set_postfix(loss=f"{loss.item():.4f}")
+
+    train_loss = total_loss / len(train_loader)
+
+    # ---------------------------------------------------
+    # VALIDATION
+    # ---------------------------------------------------
+
+    flow_encoder.eval()
+    text_encoder.eval()
+    graph_encoder.eval()
+    fusion.eval()
+    classifier.eval()
+
+    y_true = []
+    y_pred = []
+
+    with torch.no_grad():
 
         graph_emb = graph_encoder(graph)
 
-        fused, gates = fusion(flow_emb, text_emb, graph_emb)
+        for step, (x, y) in enumerate(val_loader):
 
-        logits = classifier(fused)
+            x = x.to(DEVICE)
 
-        loss = criterion(logits, y)
+            with torch.amp.autocast("cuda"):
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+                flow_emb = flow_encoder(x)
+                text_emb = text_encoder(batch_reports(len(x), step))
+                fused, _ = fusion(flow_emb, text_emb, graph_emb)
+                logits = classifier(fused)
 
-        total_loss += loss.item()
+            pred = logits.argmax(1)
 
-    avg_loss = total_loss / len(train_loader)
+            y_true.extend(y.numpy())
+            y_pred.extend(pred.cpu().numpy())
 
-    history.append([epoch + 1, avg_loss])
+    _, _, val_f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
 
-    print(f"Epoch {epoch+1} Loss = {avg_loss:.4f}")
+    history.append([epoch + 1, train_loss, val_f1])
+
+    print(
+        f"Epoch {epoch+1} | "
+        f"Loss={train_loss:.4f} | "
+        f"Val F1={val_f1:.4f}"
+    )
+
+    # Save Best Model
+
+    if val_f1 > best_f1:
+
+        best_f1 = val_f1
+        patience_counter = 0
+
+        torch.save(
+            {
+                "flow": flow_encoder.state_dict(),
+                "text": text_encoder.state_dict(),
+                "graph": graph_encoder.state_dict(),
+                "fusion": fusion.state_dict(),
+                "classifier": classifier.state_dict(),
+            },
+            ART / "best.pt",
+        )
+
+        print("✓ Best model saved")
+
+    else:
+
+        patience_counter += 1
+
+    if patience_counter >= PATIENCE:
+
+        print("Early stopping triggered.")
+        break
+
+# -------------------------------------------------------
+# LOAD BEST MODEL
+# -------------------------------------------------------
+
+ckpt = torch.load(ART / "best.pt", map_location=DEVICE)
+
+flow_encoder.load_state_dict(ckpt["flow"])
+text_encoder.load_state_dict(ckpt["text"])
+graph_encoder.load_state_dict(ckpt["graph"])
+fusion.load_state_dict(ckpt["fusion"])
+classifier.load_state_dict(ckpt["classifier"])
 
 # -------------------------------------------------------
 # TEST
 # -------------------------------------------------------
 
-print("\nEvaluating...")
+print("\nEvaluating Best Model...")
 
 flow_encoder.eval()
 text_encoder.eval()
@@ -144,16 +239,14 @@ with torch.no_grad():
 
         x = x.to(DEVICE)
 
-        flow_emb = flow_encoder(x)
+        with torch.amp.autocast("cuda"):
 
-        text_emb = text_encoder(batch_reports(len(x), step))
-
-        fused, gates = fusion(flow_emb, text_emb, graph_emb)
-
-        logits = classifier(fused)
+            flow_emb = flow_encoder(x)
+            text_emb = text_encoder(batch_reports(len(x), step))
+            fused, gates = fusion(flow_emb, text_emb, graph_emb)
+            logits = classifier(fused)
 
         prob = torch.softmax(logits, dim=1)
-
         pred = prob.argmax(1)
 
         y_true.extend(y.numpy())
@@ -183,7 +276,7 @@ with open(ART / "metrics.json", "w") as f:
 
 pd.DataFrame(
     history,
-    columns=["epoch", "train_loss"]
+    columns=["epoch", "train_loss", "val_f1"],
 ).to_csv(ART / "train_log.csv", index=False)
 
 np.save(ART / "y_true.npy", np.array(y_true))
@@ -191,22 +284,12 @@ np.save(ART / "y_pred.npy", np.array(y_pred))
 np.save(ART / "y_prob.npy", np.array(y_prob))
 np.save(ART / "gates.npy", np.array(gate_store))
 
-torch.save(
-    {
-        "flow": flow_encoder.state_dict(),
-        "text": text_encoder.state_dict(),
-        "graph": graph_encoder.state_dict(),
-        "fusion": fusion.state_dict(),
-        "classifier": classifier.state_dict(),
-    },
-    ART / "best.pt",
-)
-
-print("\n==============================")
-print("CROSSGUARD TEST RESULTS")
-print("==============================")
+print("\n" + "=" * 50)
+print("CROSSGUARD FINAL TEST RESULTS")
+print("=" * 50)
 print(f"Accuracy        : {acc:.4f}")
 print(f"Macro Precision : {p:.4f}")
 print(f"Macro Recall    : {r:.4f}")
 print(f"Macro F1        : {f1:.4f}")
-print("\nArtifacts saved to ./artifacts/")
+print("=" * 50)
+print("Artifacts saved in ./artifacts/")
